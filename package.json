@@ -1,0 +1,12 @@
+{
+  "name": "udemy-bot",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "puppeteer-core": "^22.0.0",
+    "twitter-api-v2": "^1.15.0"
+  }
+}

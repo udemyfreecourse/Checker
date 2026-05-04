@@ -1,7 +1,7 @@
 {
   "name": "udemy-bot",
   "version": "1.0.0",
-  "main": "index.js",
+  "main": "udemy.js",
   "scripts": {
     "start": "node index.js"
   },

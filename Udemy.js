@@ -416,4 +416,454 @@ async function postTwitter(courses) {
 
     if (usedLong) { log(`🐦 Twitter: all long posts sent ✅`); return; }
 
-    // ── Fallb
+    // ── Fallback: thread of short tweets ─────────────────────────────────────
+    const tweets = buildThread(courses);
+    const tTotal = tweets.length;
+    log(`🐦 Twitter fallback: posting thread of ${tTotal} tweets...`);
+    replyToId = null;
+    let successCount = 0;
+
+    for (let i = 0; i < tweets.length; i++) {
+        const text = tweets[i];
+        log(`  Thread ${i+1}/${tTotal}: ${text.length} chars...`);
+        let lastErr = null, attempt = 0;
+        while (attempt < 3) {
+            if (attempt > 0) { log(`  Retrying thread tweet ${i+1}...`); await sleep(10000); }
+            try {
+                const payload = replyToId
+                    ? { text, reply: { in_reply_to_tweet_id: replyToId } }
+                    : { text };
+                const { data } = await rwClient.v2.tweet(payload);
+                replyToId = data.id;
+                successCount++;
+                log(`  ✅ Thread ${i+1}/${tTotal} sent! https://x.com/i/status/${data.id}`);
+                state.lastError = null;
+                if (i === 0) recordPost('twitter', courses, text.length, 1, tTotal, null);
+                lastErr = null;
+                break;
+            } catch (e) {
+                const errBody = e?.data ? JSON.stringify(e.data) : (e?.message || String(e));
+                const status  = e?.code || e?.data?.status || 0;
+                lastErr = `HTTP ${status}: ${errBody.substring(0, 80)}`;
+                console.error(`[Twitter thread ${i+1} error]`, errBody);
+            }
+            attempt++;
+        }
+        if (lastErr) {
+            log(`  ❌ Thread ${i+1} failed: ${lastErr}`);
+            state.lastError = lastErr;
+            if (i === 0) recordPost('twitter', courses, text.length, 1, tTotal, lastErr);
+        }
+        if (i < tweets.length - 1) await sleep(3000);
+    }
+    log(`🐦 Thread complete: ${successCount}/${tTotal} tweets sent`);
+}
+
+async function postAllCourses(courses) {
+    if (!courses.length) return;
+    if (POST_TO_FACEBOOK)  { await postFacebook(courses);  await sleep(3000); }
+    if (POST_TO_REDDIT)    { await postReddit(courses);    await sleep(3000); }
+    if (POST_TO_LINKEDIN)  { await postLinkedIn(courses);  await sleep(3000); }
+    if (POST_TO_TELEGRAM)  { await postTelegram(courses);  await sleep(3000); }
+    if (POST_TO_TUMBLR)    { await postTumblr(courses);    await sleep(3000); }
+    if (POST_TO_WORDPRESS) { await postWordPress(courses); await sleep(3000); }
+    if (POST_TO_TWITTER)   { await postTwitter(courses);  }
+}
+
+// ── Networking — from file 1 (proven working) ────────────────────────────────
+function fetchJson(url) {
+    return new Promise((resolve, reject) => {
+        const lib = url.startsWith('https') ? https : http;
+        const req = lib.get(url, {
+            headers: { 'User-Agent': 'Mozilla/5.0 Chrome/124.0.0.0', 'Accept': 'application/json' }
+        }, res => {
+            if ([301,302,303].includes(res.statusCode) && res.headers.location)
+                return fetchJson(res.headers.location).then(resolve).catch(reject);
+            let data = '';
+            res.on('data', c => data += c);
+            res.on('end', () => { try { resolve(JSON.parse(data)); } catch(e) { reject(e); } });
+        });
+        req.on('error', reject);
+        req.setTimeout(15000, () => { req.destroy(); reject(new Error('Timeout')); });
+    });
+}
+
+async function getCoursesLast48h() {
+    const { from, to } = getDateRange();
+    log(`Fetching courses ${from} → ${to} (last 48h IST)...`);
+    state.dateFrom = from;
+    state.dateTo   = to;
+
+    const cutoffTime = Date.now() - 48 * 60 * 60 * 1000;
+    const all  = [];
+    let   page = 1;
+    let   stop = false;
+
+    while (!stop) {
+        log(`  Page ${page}...`);
+        try {
+            const json    = await fetchJson(`https://freewebcart.com/api/courses?page=${page}`);
+            const courses = json.data || json.courses || json || [];
+            if (!Array.isArray(courses) || courses.length === 0) { log('  Done.'); break; }
+
+            let n = 0;
+            for (const c of courses) {
+                if (!c.publishedAt) continue;
+                const pubDate = c.publishedAt.substring(0, 10);
+                if (pubDate >= from && pubDate <= to) {
+                    if (c.publishedAt.length > 10) {
+                        const pubMs = new Date(c.publishedAt).getTime();
+                        if (!isNaN(pubMs) && pubMs < cutoffTime) continue;
+                    }
+                    const udemyUrl = c.sourceUrl || c.source_url || c.udemy_url || c.url || '';
+                    if (udemyUrl && udemyUrl.includes('udemy.com/course')) {
+                        all.push({ title: c.title, publishedAt: c.publishedAt, freewebcartUrl: `https://freewebcart.com/course/${c.slug}/`, udemyUrl });
+                        n++;
+                    } else { log(`  ⚠ No sourceUrl: ${c.title}`); }
+                } else if (pubDate < from) { stop = true; break; }
+            }
+            log(`  Page ${page}: ${n} in window`);
+            if (!stop) { page++; await sleep(300); }
+        } catch(e) { log(`  Error: ${e.message}`); break; }
+    }
+    log(`Total in last 48h: ${all.length}`);
+    return all;
+}
+
+function loadCookies(f) {
+    const cookies = [];
+    try {
+        for (const line of fs.readFileSync(f, 'utf8').split('\n')) {
+            if (!line.trim() || line.startsWith('#')) continue;
+            const p = line.split('\t');
+            if (p.length >= 7) cookies.push({
+                name: p[5].trim(), value: p[6].trim(),
+                domain: p[0].trim().replace(/^\./, ''),
+                path: p[2].trim(), secure: p[3].trim().toUpperCase() === 'TRUE', httpOnly: false
+            });
+        }
+        log(`Loaded ${cookies.length} cookies`);
+    } catch(e) { log('No cookie file'); }
+    return cookies;
+}
+
+async function checkUdemyFree(page, url) {
+    try {
+        await page.goto(url, { waitUntil: 'networkidle2', timeout: 40000 });
+        await sleep(4000);
+        return await page.evaluate(() => {
+            const txt = document.body.innerText || '';
+            if (/\bFree\b/i.test(txt) && /100%\s*off/i.test(txt)) return true;
+            const buySection = document.querySelector('[data-purpose="course-price-text--discount-price"]') || document.querySelector('[class*="discount-price"]');
+            if (buySection && /\bFree\b/i.test(buySection.innerText)) return true;
+            const allPriceEls = document.querySelectorAll('[class*="price"], [data-purpose*="price"]');
+            for (const el of allPriceEls) {
+                if (/\bFree\b/i.test(el.innerText) && /100%/i.test(el.innerText)) return true;
+                if (/\bFree\b/i.test(el.innerText)) {
+                    const parent = el.closest('[class*="price"], [class*="purchase"]') || el.parentElement;
+                    if (parent && /100%\s*off|₹[0-9]/.test(parent.innerText)) return true;
+                }
+            }
+            const priceEl   = document.querySelector('[data-purpose="course-price-text"]');
+            const container = document.querySelector('[data-purpose="price-text-container"]');
+            const enrollBtn = document.querySelector('[data-purpose="enroll-button"]');
+            const cartBtn   = document.querySelector('[data-purpose="add-to-cart-button"]');
+            if (container && /\bFree\b/i.test(container.innerText)) return true;
+            if (priceEl   && /\bFree\b/i.test(priceEl.innerText))   return true;
+            if (enrollBtn && !cartBtn) return true;
+            if (priceEl) {
+                const nums = priceEl.innerText.replace(/[,₹$£€\s]/g, '').match(/\d+/g);
+                if (nums && nums.every(n => parseInt(n) === 0)) return true;
+            }
+            return false;
+        });
+    } catch(e) { return false; }
+}
+
+function saveResults(from, to, allItems, freeCourses) {
+    const label      = from === to ? from : `${from}_to_${to}`;
+    const outputFile = path.join(OUTPUT_DIR, `udemy_${label}.txt`);
+    const sorted     = sortEnglishFirst(freeCourses);
+    let out = `UDEMY FREE COURSES — Last 48 Hours\nWindow: ${from} → ${to} (IST)\nGenerated: ${new Date().toLocaleString()}\nChecked: ${allItems.length} | Free: ${freeCourses.length}\n${'='.repeat(60)}\n\n`;
+    sorted.forEach((c, i) => { out += `${i + 1}. ${c.title}\n   Udemy: ${c.udemyUrl}\n   FWC  : ${c.freewebcartUrl}\n${'-'.repeat(50)}\n`; });
+    if (!freeCourses.length) out += 'No free courses found.\n';
+    fs.writeFileSync(outputFile, out, 'utf8');
+    log(`Saved → ${outputFile}`);
+}
+
+async function runCheck() {
+    if (state.running) { log('Already running, skipping...'); return; }
+    state.running      = true;
+    state.lastRun      = new Date().toISOString();
+    state.nextRun      = new Date(Date.now() + INTERVAL_MS).toISOString();
+    state.progress     = 0;
+    state.currentTitle = 'Starting...';
+
+    log(`\n${'='.repeat(50)}`);
+    log('Run started — scanning last 48 hours');
+
+    const allItems = await getCoursesLast48h();
+    state.totalFound = allItems.length;
+    if (!allItems.length) { log('No courses found.'); state.running = false; return; }
+
+    const browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-blink-features=AutomationControlled'] });
+    const udPage  = await browser.newPage();
+    await udPage.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0 Safari/537.36');
+    await udPage.evaluateOnNewDocument(() => { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); });
+
+    const cookies = loadCookies(COOKIE_FILE);
+    if (cookies.length) {
+        await udPage.goto('https://www.udemy.com', { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});
+        for (const c of cookies) await udPage.setCookie(c).catch(() => {});
+    }
+
+    const newFree = [];
+    for (let i = 0; i < allItems.length; i++) {
+        const item = allItems[i];
+        state.currentTitle = item.title;
+        state.progress     = Math.round(((i + 1) / allItems.length) * 100);
+        log(`[${i+1}/${allItems.length}] ${item.title.substring(0, 50)}...`);
+        const isFree = await checkUdemyFree(udPage, item.udemyUrl);
+        if (isFree) {
+            log('  ✅ FREE!');
+            newFree.push(item);
+            if (!state.freeCourses.find(x => x.udemyUrl === item.udemyUrl))
+                state.freeCourses.unshift({ ...item, foundAt: new Date().toLocaleTimeString() });
+        } else { log('  💰 Paid'); }
+    }
+
+    await browser.close();
+    state.currentTitle = 'Done';
+    saveResults(state.dateFrom, state.dateTo, allItems, newFree);
+
+    if (newFree.length > 0) await postAllCourses(newFree);
+    else log('No free courses — skipping posts.');
+
+    log(`Done — ${newFree.length} free course(s).`);
+    state.running = false;
+}
+
+// ── Dashboard ─────────────────────────────────────────────────────────────────
+function startDashboard() {
+    const server = http.createServer((req, res) => {
+        if (req.url === '/api/state') {
+            res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+            res.end(JSON.stringify(state));
+            return;
+        }
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Udemy Free Checker</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Sora:wght@300;500;700&display=swap');
+  :root{--bg:#0a0d14;--surface:#111827;--card:#161e2e;--border:#1f2d42;--accent:#00e5ff;--green:#00ff99;--yellow:#ffd166;--red:#ff4d6d;--blue:#3b82f6;--orange:#ff6b35;--linkedin:#0a66c2;--tg:#26a5e4;--tw:#1d9bf0;--text:#e2e8f0;--muted:#64748b}
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{background:var(--bg);color:var(--text);font-family:'Sora',sans-serif;min-height:100vh;padding:22px}
+  header{display:flex;align-items:center;gap:13px;margin-bottom:20px;flex-wrap:wrap}
+  .dot{width:10px;height:10px;border-radius:50%;background:var(--green);box-shadow:0 0 8px var(--green);animation:pulse 1.5s infinite;flex-shrink:0}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+  h1{font-family:'Space Mono',monospace;font-size:1.1rem;letter-spacing:2px;color:var(--accent)}
+  .badge{display:inline-block;padding:2px 7px;border-radius:4px;font-size:.61rem;font-family:'Space Mono',monospace}
+  .b-run{background:rgba(0,229,255,.15);color:var(--accent)}.b-idle{background:rgba(100,116,139,.15);color:var(--muted)}
+  .b-on{background:rgba(0,255,153,.1);color:var(--green)}.b-off{background:rgba(100,116,139,.1);color:var(--muted)}
+  .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:10px;margin-bottom:13px}
+  .stat{background:var(--card);border:1px solid var(--border);border-radius:9px;padding:12px}
+  .sl{font-size:.58rem;letter-spacing:1.8px;color:var(--muted);text-transform:uppercase;margin-bottom:5px}
+  .sv{font-family:'Space Mono',monospace;font-size:1.5rem;font-weight:700}
+  .sv.g{color:var(--green)}.sv.b{color:var(--accent)}.sv.y{color:var(--yellow)}.sv.fb{color:var(--blue)}.sv.rd{color:var(--orange)}.sv.li{color:var(--linkedin)}.sv.tg{color:var(--tg)}.sv.tb{color:#8ab4d4}.sv.wp{color:#5ba4c8}.sv.tw{color:var(--tw)}
+  .ss{font-size:.57rem;color:var(--muted);margin-top:2px;font-family:'Space Mono',monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .bar-wrap{background:var(--card);border:1px solid var(--border);border-radius:9px;padding:12px;margin-bottom:13px}
+  .bar-meta{font-size:.7rem;color:var(--muted);margin-bottom:7px;display:flex;justify-content:space-between}
+  .bar-track{background:var(--border);border-radius:99px;height:5px;overflow:hidden}
+  .bar-fill{height:100%;background:linear-gradient(90deg,var(--accent),var(--green));border-radius:99px;transition:width .4s}
+  .cur{font-size:.73rem;color:var(--yellow);margin-top:6px;font-family:'Space Mono',monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .platforms{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:11px;margin-bottom:13px}
+  .plat{background:var(--card);border:1px solid var(--border);border-radius:9px;padding:13px}
+  .plat-head{display:flex;align-items:center;gap:7px;margin-bottom:9px;flex-wrap:wrap}
+  .plat-head h2{font-family:'Space Mono',monospace;font-size:.63rem;letter-spacing:2px;color:var(--muted);text-transform:uppercase;flex:1}
+  .split-tag{font-family:'Space Mono',monospace;font-size:.57rem;padding:1px 6px;border-radius:3px}
+  .split-no{background:rgba(0,255,153,.08);color:var(--green);border:1px solid rgba(0,255,153,.2)}
+  .split-yes{background:rgba(255,213,102,.08);color:var(--yellow);border:1px solid rgba(255,213,102,.2)}
+  .plat-setup{font-size:.7rem;color:var(--muted);line-height:1.6;background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:8px;margin-bottom:9px}
+  .plat-setup code{background:rgba(0,229,255,.1);color:var(--accent);font-family:'Space Mono',monospace;padding:1px 4px;border-radius:3px;font-size:.67rem}
+  .ph-h{font-family:'Space Mono',monospace;font-size:.58rem;letter-spacing:2px;color:var(--muted);text-transform:uppercase;margin-bottom:6px}
+  .ph-list{display:flex;flex-direction:column;gap:4px;max-height:160px;overflow-y:auto}
+  .ph-item{border:1px solid var(--border);border-radius:5px;padding:6px 8px}
+  .ph-item.ok-facebook{border-left:3px solid var(--blue)}.ph-item.ok-reddit{border-left:3px solid var(--orange)}.ph-item.ok-linkedin{border-left:3px solid var(--linkedin)}.ph-item.ok-telegram{border-left:3px solid var(--tg)}.ph-item.ok-tumblr{border-left:3px solid #8ab4d4}.ph-item.ok-wordpress{border-left:3px solid #5ba4c8}.ph-item.ok-twitter{border-left:3px solid var(--tw)}.ph-item.fail{border-left:3px solid var(--red)}
+  .ph-time{font-family:'Space Mono',monospace;font-size:.58rem;color:var(--muted);margin-bottom:1px}
+  .ph-prev{font-size:.7rem;color:var(--text);margin-bottom:2px;line-height:1.3}
+  .ph-meta{font-size:.58rem;display:flex;gap:6px;flex-wrap:wrap}
+  .ph-cnt{color:var(--green)}.ph-chr{color:var(--muted)}.ph-pt{color:var(--yellow)}.ph-err{color:var(--red)}
+  .err-banner{background:rgba(255,77,109,.08);border:1px solid rgba(255,77,109,.2);border-radius:5px;padding:6px 9px;color:var(--red);font-size:.68rem;margin-top:6px;font-family:'Space Mono',monospace}
+  .bottom{display:grid;grid-template-columns:2fr 1fr;gap:11px}
+  @media(max-width:800px){.bottom{grid-template-columns:1fr}}
+  .panel{background:var(--card);border:1px solid var(--border);border-radius:9px;padding:13px;overflow:hidden}
+  .panel h2{font-family:'Space Mono',monospace;font-size:.63rem;letter-spacing:2px;color:var(--muted);text-transform:uppercase;margin-bottom:10px}
+  .clist{display:flex;flex-direction:column;gap:7px;max-height:440px;overflow-y:auto}
+  .ci{background:var(--surface);border:1px solid var(--border);border-left:3px solid var(--green);border-radius:6px;padding:8px}
+  .ci.non-en{border-left-color:var(--yellow)}
+  .ct{font-size:.78rem;font-weight:600;margin-bottom:3px;line-height:1.35}
+  .cl{display:flex;gap:4px;flex-wrap:wrap;margin-bottom:2px}
+  .btn{font-size:.63rem;padding:2px 7px;border-radius:4px;text-decoration:none;font-family:'Space Mono',monospace}
+  .bu{background:rgba(0,229,255,.09);color:var(--accent);border:1px solid rgba(0,229,255,.2)}
+  .bf{background:rgba(0,255,153,.07);color:var(--green);border:1px solid rgba(0,255,153,.2)}
+  .cft{font-size:.57rem;color:var(--muted)}
+  .lang-tag{font-size:.55rem;padding:1px 5px;border-radius:3px;font-family:'Space Mono',monospace;background:rgba(255,213,102,.1);color:var(--yellow);border:1px solid rgba(255,213,102,.2)}
+  .lw{font-family:'Space Mono',monospace;font-size:.63rem;color:var(--muted);max-height:440px;overflow-y:auto;line-height:1.9}
+  .ll{border-bottom:1px solid #1a2236;padding:1px 0}
+  .ll.free{color:var(--green)}.ll.fb{color:var(--blue)}.ll.reddit{color:var(--orange)}.ll.li{color:var(--linkedin)}.ll.tg{color:var(--tg)}.ll.tb{color:#8ab4d4}.ll.wp{color:#5ba4c8}.ll.tw{color:var(--tw)}.ll.err{color:var(--red)}
+  ::-webkit-scrollbar{width:4px}::-webkit-scrollbar-track{background:var(--border)}::-webkit-scrollbar-thumb{background:var(--muted);border-radius:2px}
+</style>
+</head>
+<body>
+<header>
+  <div class="dot" id="dot"></div>
+  <h1>UDEMY FREE CHECKER</h1>
+  <span class="badge b-idle" id="sb">IDLE</span>
+  <span style="font-family:'Space Mono',monospace;font-size:.63rem;color:var(--muted)">⏱ 48hr · 7 platforms · EN first · OAuth 1.0a User Context</span>
+</header>
+<div class="stats">
+  <div class="stat"><div class="sl">Window</div><div class="sv b" style="font-size:.74rem;margin-top:2px" id="s-win">—</div></div>
+  <div class="stat"><div class="sl">Checked</div><div class="sv" id="s-tot">0</div></div>
+  <div class="stat"><div class="sl">Free Found</div><div class="sv g" id="s-free">0</div></div>
+  <div class="stat"><div class="sl">Next Run</div><div class="sv y" style="font-size:.82rem;margin-top:2px" id="s-next">—</div></div>
+  <div class="stat"><div class="sl">FB</div><div class="sv fb" id="s-fb">0</div><div class="ss" id="s-fbt">—</div></div>
+  <div class="stat"><div class="sl">Reddit</div><div class="sv rd" id="s-rd">0</div><div class="ss" id="s-rdt">—</div></div>
+  <div class="stat"><div class="sl">LinkedIn</div><div class="sv li" id="s-li">0</div><div class="ss" id="s-lit">—</div></div>
+  <div class="stat"><div class="sl">Telegram</div><div class="sv tg" id="s-tg">0</div><div class="ss" id="s-tgt">—</div></div>
+  <div class="stat"><div class="sl">Tumblr</div><div class="sv tb" id="s-tb">0</div><div class="ss" id="s-tbt">—</div></div>
+  <div class="stat"><div class="sl">WordPress</div><div class="sv wp" id="s-wp">0</div><div class="ss" id="s-wpt">—</div></div>
+  <div class="stat"><div class="sl">Twitter/X</div><div class="sv tw" id="s-tw">0</div><div class="ss" id="s-twt">—</div></div>
+</div>
+<div class="bar-wrap">
+  <div class="bar-meta"><span>Progress</span><span id="bp">0%</span></div>
+  <div class="bar-track"><div class="bar-fill" id="bar" style="width:0%"></div></div>
+  <div class="cur" id="cur">Waiting...</div>
+</div>
+<div class="platforms">
+  <div class="plat">
+    <div class="plat-head"><h2>📘 Facebook</h2><span class="split-tag split-no">NO SPLIT</span><span class="badge ${POST_TO_FACEBOOK?'b-on':'b-off'}">${POST_TO_FACEBOOK?'ON':'OFF'}</span></div>
+    <div class="plat-setup">Event: <code>${IFTTT_FB_EVENT}</code><br>→ Facebook Pages → Create a status update → <code>{{Value1}}</code></div>
+    <div class="ph-h">Post History</div><div class="ph-list" id="ph-fb"><p style="color:var(--muted);font-size:.7rem">No posts yet</p></div>
+    <div id="err-fb" style="display:none" class="err-banner"></div>
+  </div>
+  <div class="plat">
+    <div class="plat-head"><h2>🟠 Reddit</h2><span class="split-tag split-no">NO SPLIT</span><span class="badge ${POST_TO_REDDIT?'b-on':'b-off'}">${POST_TO_REDDIT?'ON':'OFF'}</span></div>
+    <div class="plat-setup">Event: <code>${IFTTT_REDDIT_EVENT}</code><br>Title → <code>{{Value2}}</code> · Text → <code>{{Value1}}</code><br>Subreddit → <code>${REDDIT_SUBREDDIT}</code></div>
+    <div class="ph-h">Post History</div><div class="ph-list" id="ph-rd"><p style="color:var(--muted);font-size:.7rem">No posts yet</p></div>
+    <div id="err-rd" style="display:none" class="err-banner"></div>
+  </div>
+  <div class="plat">
+    <div class="plat-head"><h2>💼 LinkedIn</h2><span class="split-tag split-yes">SPLIT ${LINKEDIN_CHAR_LIMIT}</span><span class="badge ${POST_TO_LINKEDIN?'b-on':'b-off'}">${POST_TO_LINKEDIN?'ON':'OFF'}</span></div>
+    <div class="plat-setup">Event: <code>${IFTTT_LINKEDIN_EVENT}</code><br>→ Share an update → <code>{{Value1}}</code></div>
+    <div class="ph-h">Post History</div><div class="ph-list" id="ph-li"><p style="color:var(--muted);font-size:.7rem">No posts yet</p></div>
+    <div id="err-li" style="display:none" class="err-banner"></div>
+  </div>
+  <div class="plat">
+    <div class="plat-head"><h2>✈️ Telegram</h2><span class="split-tag split-yes">SPLIT ${TELEGRAM_CHAR_LIMIT}</span><span class="badge ${POST_TO_TELEGRAM?'b-on':'b-off'}">${POST_TO_TELEGRAM?'ON':'OFF'}</span></div>
+    <div class="plat-setup">Event: <code>${IFTTT_TELEGRAM_EVENT}</code><br>→ Send message → <code>{{Value1}}</code></div>
+    <div class="ph-h">Post History</div><div class="ph-list" id="ph-tg"><p style="color:var(--muted);font-size:.7rem">No posts yet</p></div>
+    <div id="err-tg" style="display:none" class="err-banner"></div>
+  </div>
+  <div class="plat">
+    <div class="plat-head"><h2>📓 Tumblr</h2><span class="split-tag split-yes">HTML · SPLIT ${TUMBLR_CHAR_LIMIT}</span><span class="badge ${POST_TO_TUMBLR?'b-on':'b-off'}">${POST_TO_TUMBLR?'ON':'OFF'}</span></div>
+    <div class="plat-setup">Event: <code>${IFTTT_TUMBLR_EVENT}</code><br>Title → <code>{{Value2}}</code> · Body → <code>{{Value1}}</code> · Tags → <code>{{Value3}}</code></div>
+    <div class="ph-h">Post History</div><div class="ph-list" id="ph-tb"><p style="color:var(--muted);font-size:.7rem">No posts yet</p></div>
+    <div id="err-tb" style="display:none" class="err-banner"></div>
+  </div>
+  <div class="plat">
+    <div class="plat-head"><h2>🌐 WordPress</h2><span class="split-tag split-yes">HTML · SPLIT ${WORDPRESS_CHAR_LIMIT}</span><span class="badge ${POST_TO_WORDPRESS?'b-on':'b-off'}">${POST_TO_WORDPRESS?'ON':'OFF'}</span></div>
+    <div class="plat-setup">Event: <code>${IFTTT_WORDPRESS_EVENT}</code><br>Title → <code>{{Value2}}</code> · Content → <code>{{Value1}}</code> · Tags → <code>{{Value3}}</code></div>
+    <div class="ph-h">Post History</div><div class="ph-list" id="ph-wp"><p style="color:var(--muted);font-size:.7rem">No posts yet</p></div>
+    <div id="err-wp" style="display:none" class="err-banner"></div>
+  </div>
+  <div class="plat">
+    <div class="plat-head"><h2>🐦 Twitter / X</h2><span class="split-tag split-yes">OAUTH 1.0a · LONG + 🧵</span><span class="badge ${POST_TO_TWITTER?'b-on':'b-off'}">${POST_TO_TWITTER?'ON':'OFF'}</span></div>
+    <div class="plat-setup">
+      Direct v2 API · <code>client.readWrite</code> (User Context)<br>
+      <span style="color:var(--green);font-size:.65rem">✅ Tries long post (${TWITTER_LONG_LIMIT} chars) first</span><br>
+      <span style="color:var(--yellow);font-size:.65rem">🧵 Falls back to ${TWITTER_SHORT_LIMIT}-char tweet thread</span><br>
+      <code>npm install twitter-api-v2</code>
+    </div>
+    <div class="ph-h">Post History</div><div class="ph-list" id="ph-tw"><p style="color:var(--muted);font-size:.7rem">No posts yet</p></div>
+    <div id="err-tw" style="display:none" class="err-banner"></div>
+  </div>
+</div>
+<div class="bottom">
+  <div class="panel">
+    <h2>✅ Free Courses — last 48 hrs (🟢 English · 🟡 Other)</h2>
+    <div class="clist" id="clist"><p style="color:var(--muted);font-size:.8rem">No free courses yet</p></div>
+  </div>
+  <div class="panel">
+    <h2>📋 Live Log</h2>
+    <div class="lw" id="lw"></div>
+  </div>
+</div>
+<script>
+let lastFree=0,lastPostsLen=0;
+function isNonEnglish(t){return/[\u0400-\u04FF\u0600-\u06FF\u0590-\u05FF\u3000-\u9FFF\uAC00-\uD7AF\u0900-\u097F\u0E00-\u0E7F]/.test(t)||/[àáâãèéêìíòóôõùúýăđơưạảấầẩẫậắằẳẵặẹẻẽếềểễệỉịọỏốồổỗộớờởỡợụủứừửữựỳỵỷỹ]/i.test(t);}
+function countdown(iso){if(!iso)return'—';const d=new Date(iso)-Date.now();if(d<=0)return'Any moment...';const h=Math.floor(d/3600000),m=Math.floor((d%3600000)/60000),s=Math.floor((d%60000)/1000);return(h?h+'h ':'')+m+'m '+s+'s';}
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function renderPlatform(posts,platform,listId,errId){
+  const filtered=posts.filter(p=>p.platform===platform);
+  const lastErr=filtered.find(p=>p.error);
+  const eb=document.getElementById(errId);
+  if(lastErr){eb.style.display='block';eb.textContent='❌ '+lastErr.error;}else eb.style.display='none';
+  document.getElementById(listId).innerHTML=filtered.length
+    ?filtered.map(p=>\`<div class="ph-item \${p.error?'fail':'ok-'+p.platform}"><div class="ph-time">\${esc(p.time)}</div><div class="ph-prev">\${esc(p.preview)}</div><div class="ph-meta"><span class="ph-cnt">\${p.count} courses</span><span class="ph-chr">\${p.chars} chars</span>\${p.totalParts>1?'<span class="ph-pt">Part '+p.part+'/'+p.totalParts+'</span>':''}\${p.error?'<span class="ph-err">❌ '+esc(p.error)+'</span>':'<span style="color:var(--green)">✅ sent</span>'}</div></div>\`).join('')
+    :'<p style="color:var(--muted);font-size:.7rem">No posts yet</p>';
+}
+async function poll(){
+  try{
+    const d=await(await fetch('/api/state')).json();
+    document.getElementById('s-win').textContent=(d.dateFrom&&d.dateTo)?d.dateFrom+' → '+d.dateTo:'—';
+    document.getElementById('s-tot').textContent=d.totalFound||0;
+    document.getElementById('s-free').textContent=d.freeCourses.length;
+    document.getElementById('s-next').textContent=countdown(d.nextRun);
+    document.getElementById('bp').textContent=(d.progress||0)+'%';
+    document.getElementById('bar').style.width=(d.progress||0)+'%';
+    document.getElementById('cur').textContent=d.currentTitle||'';
+    [['facebook','fb'],['reddit','rd'],['linkedin','li'],['telegram','tg'],['tumblr','tb'],['wordpress','wp'],['twitter','tw']].forEach(([p,k])=>{
+      const arr=d.posts.filter(x=>x.platform===p);
+      document.getElementById('s-'+k).textContent=arr.length;
+      document.getElementById('s-'+k+'t').textContent=arr.length?'Last: '+arr[0].time:'Never';
+    });
+    const sb=document.getElementById('sb'),dot=document.getElementById('dot');
+    if(d.running){sb.textContent='RUNNING';sb.className='badge b-run';dot.style.background='var(--accent)';dot.style.boxShadow='0 0 8px var(--accent)';}
+    else{sb.textContent='IDLE';sb.className='badge b-idle';dot.style.background='var(--green)';dot.style.boxShadow='0 0 8px var(--green)';}
+    if(d.posts.length!==lastPostsLen){
+      lastPostsLen=d.posts.length;
+      [['facebook','fb'],['reddit','rd'],['linkedin','li'],['telegram','tg'],['tumblr','tb'],['wordpress','wp'],['twitter','tw']].forEach(([p,k])=>renderPlatform(d.posts,p,'ph-'+k,'err-'+k));
+    }
+    if(d.freeCourses.length!==lastFree){
+      lastFree=d.freeCourses.length;
+      const sorted=[...d.freeCourses.filter(c=>!isNonEnglish(c.title)),...d.freeCourses.filter(c=>isNonEnglish(c.title))];
+      document.getElementById('clist').innerHTML=sorted.length?sorted.map(c=>\`<div class="ci \${isNonEnglish(c.title)?'non-en':''}"><div class="ct">\${isNonEnglish(c.title)?'<span class="lang-tag">NON-EN</span> ':''}\${esc(c.title)}</div><div class="cl"><a href="\${esc(c.udemyUrl)}" target="_blank" class="btn bu">Udemy →</a><a href="\${esc(c.freewebcartUrl)}" target="_blank" class="btn bf">FWC →</a></div><div class="cft">📅 \${esc(c.publishedAt||'')} · Found \${c.foundAt||''}</div></div>\`).join(''):'<p style="color:var(--muted);font-size:.8rem">No free courses yet</p>';
+    }
+    document.getElementById('lw').innerHTML=d.log.map(l=>{
+      const c=l.includes('✅ FREE')?'free':l.includes('❌')?'err':l.includes('📘')||l.includes('Facebook')?'fb':l.includes('🟠')||l.includes('Reddit')?'reddit':l.includes('💼')||l.includes('LinkedIn')?'li':l.includes('✈️')||l.includes('Telegram')?'tg':l.includes('📓')||l.includes('Tumblr')?'tb':l.includes('🌐')||l.includes('WordPress')?'wp':l.includes('🐦')||l.includes('Twitter')||l.includes('🧵')?'tw':'';
+      return \`<div class="ll \${c}">\${esc(l)}</div>\`;
+    }).join('');
+  }catch(e){}
+}
+poll();setInterval(poll,3000);
+</script>
+</body>
+</html>`);
+    });
+    server.listen(DASHBOARD_PORT, () => log(`Dashboard → http://localhost:${DASHBOARD_PORT}`));
+}
+
+async function main() {
+    log('UDEMY FREE CHECKER — 7 platforms · English first · OAuth 1.0a User Context');
+    log(`🐦 Twitter: uses client.readWrite → long post (${TWITTER_LONG_LIMIT}) → 🧵 thread fallback (${TWITTER_SHORT_LIMIT}/tweet)`);
+    log(`Interval: ${INTERVAL_MS/60000}min | Dashboard: http://localhost:${DASHBOARD_PORT}`);
+    startDashboard();
+    await runCheck();
+    setInterval(async () => { log('\n⏰ Scheduled run'); await runCheck(); }, INTERVAL_MS);
+}
+
+main().catch(console.error);

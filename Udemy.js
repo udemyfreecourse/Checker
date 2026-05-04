@@ -5,8 +5,8 @@ const fs        = require('fs');
 const path      = require('path');
 
 // ── CONFIG ────────────────────────────────────────────────────────────────────
-const COOKIE_FILE    = 'C:\\Users\\Jilin James\\Pictures\\uden\\udemy_cookies.txt';
-const OUTPUT_DIR     = 'C:\\Users\\Jilin James\\Pictures\\uden';
+const COOKIE_FILE = './udemy_cookies.txt';
+const OUTPUT_DIR  = './output';
 const INTERVAL_MS    = 4 * 60 * 60 * 1000;
 const DASHBOARD_PORT = 3456;
 
